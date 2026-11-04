@@ -1,0 +1,88 @@
+# Once a month, looks for new versions of faster-whisper, CTranslate2 and the
+# other libraries of requirements.txt (.github/scripts/update_requirements.py).
+# If there are any, it builds and tests everything with them (build.yml) and,
+# only if all the builds work, publishes a new release (v1.0.1, v1.0.2...)
+# and updates main. Without new versions it does nothing.
+#
+# Actions > Update > Run workflow runs it now; with "dry run" it builds the
+# new versions but doesn't publish anything (the zips stay as artifacts).
+
+name: Update
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"   # the 1st of each month, 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: build the new versions, but don't publish a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      tag: ${{ steps.update.outputs.tag }}
+      summary: ${{ steps.update.outputs.summary }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Look for new versions
+        id: update
+        run: |
+          pip install packaging
+          python .github/scripts/update_requirements.py
+
+      # on a branch of its own until the builds work
+      - name: Commit
+        id: commit
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B auto-update
+          git commit -a -F "$RUNNER_TEMP/commit.txt"
+          git push -f origin auto-update
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: write
+    with:
+      ref: ${{ needs.check.outputs.sha }}
+      tag: ${{ inputs.dry_run != true && needs.check.outputs.tag || '' }}
+      notes: ${{ needs.check.outputs.summary }}
+
+  finish:
+    needs: [check, build]
+    if: always() && needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Update main
+        if: needs.build.result == 'success' && !inputs.dry_run
+        run: git push origin ${{ needs.check.outputs.sha }}:refs/heads/main
+
+      - name: Delete the branch
+        run: git push origin --delete auto-update

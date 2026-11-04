@@ -1,0 +1,10 @@
+# UW_FasterWhisper, tested versions
+faster-whisper==1.2.1
+ctranslate2==4.8.5
+tokenizers==0.23.3
+huggingface_hub==2.4.0
+onnxruntime==1.31.1 ; sys_platform != "darwin"
+# the newest onnxruntime for macOS needs a recent macOS, this one works from 11
+onnxruntime==1.19.2 ; sys_platform == "darwin"
+numpy<2.4 ; sys_platform == "darwin"
+numpy==2.5.4 ; sys_platform != "darwin"

@@ -1,0 +1,183 @@
+# Builds whisper-faster for Windows, macOS (Intel and Apple Silicon) and Linux,
+# with the zip names Tero downloads, and the optional GPU libraries for
+# Windows. A tag "v*" publishes them in a release, a manual run (Actions >
+# Build > Run workflow) leaves them as artifacts of the run. The monthly
+# Update workflow (update.yml) calls it with the commit and tag to publish.
+
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: commit to build (empty = the one of the event)
+        type: string
+        default: ""
+      tag:
+        description: tag of the release to publish (empty = no release)
+        type: string
+        default: ""
+      notes:
+        description: text of the release
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            zip: fasterwhisper_win64.zip
+          - os: macos-14
+            zip: fasterwhisper_macos_arm64.zip
+            platform: macosx_11_0_arm64
+          - os: macos-15-intel
+            zip: fasterwhisper_macos_x86_64.zip
+            platform: macosx_11_0_x86_64
+          - os: ubuntu-22.04
+            zip: fasterwhisper_linux.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (Windows, Linux)
+        if: runner.os != 'macOS'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      # macOS: the wheels for macOS 11 and up, not the ones of the runner
+      # (numpy and onnxruntime have builds that only run on macOS 14)
+      - name: Install (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+          pip install --only-binary=:all: --platform ${{ matrix.platform }} --python-version 3.12 --implementation cp --target site -r requirements.txt
+          echo "PYTHONPATH=$PWD/site" >> $GITHUB_ENV
+
+      - name: Build
+        run: pyinstaller --noconfirm --clean whisper-faster.spec
+
+      # a short phrase with the voice of each system, for the transcription
+      # test (it has to find the words)
+      - name: Test voice (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq espeak-ng > /dev/null
+          espeak-ng -s 140 -w voice.wav "Hello, this is a test of the subtitle program."
+
+      - name: Test voice (macOS)
+        if: runner.os == 'macOS'
+        run: say -o voice.wav --file-format=WAVE --data-format=LEI16@22050 "Hello, this is a test of the subtitle program."
+
+      - name: Test voice (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $s.SetOutputToWaveFile("$PWD\voice.wav")
+          $s.Speak("Hello, this is a test of the subtitle program.")
+          $s.Dispose()
+
+      # real transcriptions with the tiny model, as Tero runs them (a wav and
+      # a model folder): they load CTranslate2, tokenizers, numpy and, with
+      # the VAD, onnxruntime, so a library that doesn't work stops here
+      - name: Test
+        shell: bash
+        run: |
+          dist/whisper-faster/whisper-faster --version
+          dist/whisper-faster/whisper-faster --help > /dev/null
+          mkdir -p models/faster-whisper-tiny
+          for f in config.json model.bin tokenizer.json vocabulary.txt; do
+            curl -sSfL --retry 3 -o models/faster-whisper-tiny/$f https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/$f
+          done
+          run() { dist/whisper-faster/whisper-faster "$@" --model tiny --model_dir models --local_files_only True --device cpu --output_dir out; }
+          # the spoken phrase: the words have to be there
+          run voice.wav --language en --output_format srt
+          cat out/voice.srt
+          grep -q -- "-->" out/voice.srt
+          grep -qi "test" out/voice.srt
+          # stereo noise at 44.1 kHz (resampling), with and without the VAD
+          python -c "import wave, random; w = wave.open('noise.wav', 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100); w.writeframes(bytes(random.getrandbits(8) for _ in range(44100 * 4 * 3))); w.close()"
+          run noise.wav --output_format srt
+          run noise.wav --output_format json --vad_filter True --word_timestamps True
+          test -f out/noise.srt
+          test -f out/noise.json
+          rm -rf models out voice.wav noise.wav
+
+      - name: Zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/whisper-faster/* -DestinationPath ${{ matrix.zip }}
+
+      # zip keeps the execute permission (Tero extracts it with TUnZipper)
+      - name: Zip (macOS, Linux)
+        if: runner.os != 'Windows'
+        run: cd dist/whisper-faster && zip -qry ../../${{ matrix.zip }} .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.zip }}
+          path: ${{ matrix.zip }}
+
+  # cuBLAS and cuDNN for CTranslate2 4.x on Windows (CUDA 12, cuDNN 9), the
+  # DLLs at the root of the zip so they end next to whisper-faster.exe
+  gpu-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download the NVIDIA libraries
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install --target nv "nvidia-cublas-cu12==12.*" "nvidia-cudnn-cu12==9.*" "nvidia-cuda-runtime-cu12==12.*"
+          mkdir cuda
+          find nv/nvidia -name "*.dll" -exec cp {} cuda/ \;
+          ls -la cuda
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path cuda/* -DestinationPath fasterwhisper_cuda_win64.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fasterwhisper_cuda_win64.zip
+          path: fasterwhisper_cuda_win64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag
+    needs: [build, gpu-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ inputs.ref || github.sha }}
+          body: ${{ inputs.notes }}
+          files: out/*.zip
