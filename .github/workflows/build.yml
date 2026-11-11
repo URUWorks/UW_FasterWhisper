@@ -1,42 +1,99 @@
 # Builds whisper-faster for Windows, macOS (Intel and Apple Silicon) and Linux,
 # with the zip names Tero downloads, and the optional GPU libraries for
-# Windows. A tag "v*" publishes them in a release, a manual run (Actions >
-# Build > Run workflow) leaves them as artifacts of the run. The monthly
-# Update workflow (update.yml) calls it with the commit and tag to publish.
+# Windows.
+#
+# - Every month (and with Actions > Build > Run workflow > "update") it looks
+#   for new versions of faster-whisper, CTranslate2 and the rest. If there
+#   are, it builds and tests them (a real transcription on each system) and
+#   only then commits the new pins to main, tags vX.Y.0 and publishes the
+#   release. If nothing is new, or a build or test fails, nothing changes.
+# - A tag "v*" pushed by hand publishes a release with the current pins.
+# - A manual run without "update" leaves the zips as artifacts of the run.
 
 name: Build
 
 on:
+  schedule:
+    - cron: "0 6 1 * *" # day 1 of each month, 06:00 UTC
   push:
     tags: ["v*"]
   workflow_dispatch:
-  workflow_call:
     inputs:
-      ref:
-        description: commit to build (empty = the one of the event)
-        type: string
-        default: ""
-      tag:
-        description: tag of the release to publish (empty = no release)
-        type: string
-        default: ""
-      notes:
-        description: text of the release
-        type: string
-        default: ""
+      update:
+        description: "Look for new versions and publish a release if there are"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      release: ${{ steps.check.outputs.release }}
+      update: ${{ steps.check.outputs.update }}
+      version: ${{ steps.check.outputs.version }}
+      summary: ${{ steps.check.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Look for new versions
+        id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.update }}" = "true" ]; then
+            python -m venv /tmp/venv
+            /tmp/venv/bin/python -m pip install --quiet --upgrade pip
+            /tmp/venv/bin/python tools/update_pins.py > /tmp/pins.txt
+            cat /tmp/pins.txt
+            cat /tmp/pins.txt >> $GITHUB_OUTPUT
+            changed=$(grep '^changed=' /tmp/pins.txt | cut -d= -f2)
+            echo "update=$changed" >> $GITHUB_OUTPUT
+            echo "build=$changed" >> $GITHUB_OUTPUT
+            echo "release=$changed" >> $GITHUB_OUTPUT
+          else
+            echo "update=false" >> $GITHUB_OUTPUT
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "release=${{ startsWith(github.ref, 'refs/tags/v') }}" >> $GITHUB_OUTPUT
+            echo "version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' whisper_faster.py)" >> $GITHUB_OUTPUT
+          fi
+          git diff --stat
+
+      - name: Keep the files with the new versions
+        if: steps.check.outputs.update == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: sources
+          path: |
+            requirements.txt
+            requirements-build.txt
+            whisper_faster.py
+
+      # GitHub turns off the scheduled workflows of a repository without
+      # commits for 60 days, this keeps the monthly check on
+      - name: Keep the schedule on
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable" || true
+
   build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             zip: fasterwhisper_win64.zip
-          - os: macos-14
+          - os: macos-15
             zip: fasterwhisper_macos_arm64.zip
             platform: macosx_11_0_arm64
           - os: macos-15-intel
@@ -48,11 +105,15 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref }}
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v7
+      - name: New versions
+        if: needs.check.outputs.update == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: sources
+
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -75,17 +136,24 @@ jobs:
       - name: Build
         run: pyinstaller --noconfirm --clean whisper-faster.spec
 
-      # a short phrase with the voice of each system, for the transcription
-      # test (it has to find the words)
+      - name: Test the arguments
+        shell: bash
+        run: |
+          dist/whisper-faster/whisper-faster --version | tee version.txt
+          grep -q "${{ needs.check.outputs.version }}" version.txt
+          dist/whisper-faster/whisper-faster --help > /dev/null
+
+      # a short phrase with the voice of each system, transcribed with the
+      # tiny model on the CPU
       - name: Test voice (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y -qq espeak-ng > /dev/null
-          espeak-ng -s 140 -w voice.wav "Hello, this is a test of the subtitle program."
+          espeak-ng -s 140 -w test.wav "Hello, this is a test of the subtitle program."
 
       - name: Test voice (macOS)
         if: runner.os == 'macOS'
-        run: say -o voice.wav --file-format=WAVE --data-format=LEI16@22050 "Hello, this is a test of the subtitle program."
+        run: say -o test.wav --file-format=WAVE --data-format=LEI16@22050 "Hello, this is a test of the subtitle program."
 
       - name: Test voice (Windows)
         if: runner.os == 'Windows'
@@ -93,35 +161,17 @@ jobs:
         run: |
           Add-Type -AssemblyName System.Speech
           $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
-          $s.SetOutputToWaveFile("$PWD\voice.wav")
+          $s.SetOutputToWaveFile("$PWD\test.wav")
           $s.Speak("Hello, this is a test of the subtitle program.")
           $s.Dispose()
 
-      # real transcriptions with the tiny model, as Tero runs them (a wav and
-      # a model folder): they load CTranslate2, tokenizers, numpy and, with
-      # the VAD, onnxruntime, so a library that doesn't work stops here
-      - name: Test
+      - name: Test a transcription
         shell: bash
         run: |
-          dist/whisper-faster/whisper-faster --version
-          dist/whisper-faster/whisper-faster --help > /dev/null
-          mkdir -p models/faster-whisper-tiny
-          for f in config.json model.bin tokenizer.json vocabulary.txt; do
-            curl -sSfL --retry 3 -o models/faster-whisper-tiny/$f https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/$f
-          done
-          run() { dist/whisper-faster/whisper-faster "$@" --model tiny --model_dir models --local_files_only True --device cpu --output_dir out; }
-          # the spoken phrase: the words have to be there
-          run voice.wav --language en --output_format srt
-          cat out/voice.srt
-          grep -q -- "-->" out/voice.srt
-          grep -qi "test" out/voice.srt
-          # stereo noise at 44.1 kHz (resampling), with and without the VAD
-          python -c "import wave, random; w = wave.open('noise.wav', 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100); w.writeframes(bytes(random.getrandbits(8) for _ in range(44100 * 4 * 3))); w.close()"
-          run noise.wav --output_format srt
-          run noise.wav --output_format json --vad_filter True --word_timestamps True
-          test -f out/noise.srt
-          test -f out/noise.json
-          rm -rf models out voice.wav noise.wav
+          dist/whisper-faster/whisper-faster test.wav --model tiny --model_dir models --device cpu --language en --output_format srt --output_dir out
+          cat out/test.srt
+          grep -q -- "-->" out/test.srt
+          grep -qi "test" out/test.srt
 
       - name: Zip (Windows)
         if: runner.os == 'Windows'
@@ -133,7 +183,7 @@ jobs:
         if: runner.os != 'Windows'
         run: cd dist/whisper-faster && zip -qry ../../${{ matrix.zip }} .
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.zip }}
           path: ${{ matrix.zip }}
@@ -141,9 +191,11 @@ jobs:
   # cuBLAS and cuDNN for CTranslate2 4.x on Windows (CUDA 12, cuDNN 9), the
   # DLLs at the root of the zip so they end next to whisper-faster.exe
   gpu-windows:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -160,24 +212,54 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path cuda/* -DestinationPath fasterwhisper_cuda_win64.zip
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v6
         with:
           name: fasterwhisper_cuda_win64.zip
           path: fasterwhisper_cuda_win64.zip
 
+  # every release has all the zips, Tero downloads them from "latest"
   release:
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag
-    needs: [build, gpu-windows]
+    needs: [check, build, gpu-windows]
+    if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.check.outputs.version }}
+      SUMMARY: ${{ needs.check.outputs.summary }}
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v5
+        if: needs.check.outputs.update == 'true'
+        with:
+          ref: main
+
+      - name: New versions
+        if: needs.check.outputs.update == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: sources
+
+      - name: Commit and tag the new versions
+        if: needs.check.outputs.update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Update to $SUMMARY"
+          git tag "v$VERSION"
+          git push origin HEAD:main "v$VERSION"
+
+      - uses: actions/download-artifact@v7
         with:
           path: out
+          pattern: fasterwhisper_*
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          target_commitish: ${{ inputs.ref || github.sha }}
-          body: ${{ inputs.notes }}
-          files: out/*.zip
+      - name: Release
+        run: |
+          if [ "${{ needs.check.outputs.update }}" = "true" ]; then
+            tag="v$VERSION"
+            notes="Updated automatically: $SUMMARY."
+          else
+            tag="${{ github.ref_name }}"
+            notes="UWFaster-Whisper $tag"
+          fi
+          gh release create "$tag" out/*.zip --repo "${{ github.repository }}" --title "UWFaster-Whisper $tag" --notes "$notes" --latest
