@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #
-#  UW_FasterWhisper
+#  UWFaster-Whisper
 #
-#  A standalone faster-whisper command line for Tero Subtitler, with the
-#  whisper-faster executable name and command line parameters.
+#  A standalone faster-whisper command line for Tero Subtitler, compatible
+#  with the parameters of the Purfview's whisper-faster that Tero uses.
 #
 #  The contents of this file are used with permission, subject to
 #  the Mozilla Public License Version 2.0 (the "License"); you may
@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 PROG = "whisper-faster"
 
@@ -179,7 +179,7 @@ OUTPUT_FORMATS = ["txt", "vtt", "srt", "tsv", "json", "all"]
 def build_parser():
     p = argparse.ArgumentParser(
         prog=PROG,
-        description="UW_FasterWhisper %s, speech recognition with faster-whisper for Tero Subtitler." % __version__,
+        description="UWFaster-Whisper %s, speech recognition with faster-whisper." % __version__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     p.add_argument("audio", nargs="*", help="audio or video file(s) to transcribe")
@@ -443,6 +443,43 @@ def resolve_model(args):
     return m, args.model_dir
 
 
+# GPU libraries that CTranslate2 4.x loads (CUDA 12, cuDNN 9). cuDNN loads its
+# parts only when they're used and, if one is missing, the process ends without
+# an exception (Tero gets no text), so they are looked for before using the GPU.
+CUDA_LIBRARIES = {
+    "win32": ["cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll",
+              "cudnn_cnn64_9.dll"],
+    "linux": ["libcublas.so.12", "libcublasLt.so.12", "libcudnn.so.9", "libcudnn_ops.so.9",
+              "libcudnn_cnn.so.9"],
+}
+
+
+def missing_cuda_libraries():
+    import ctypes
+
+    names = CUDA_LIBRARIES.get("linux" if sys.platform.startswith("linux") else sys.platform, [])
+    missing = []
+    for name in names:
+        try:
+            if sys.platform == "win32":
+                # winmode=0: the usual search, PATH included (the CUDA installation)
+                ctypes.WinDLL(name, winmode=0)
+            else:
+                ctypes.CDLL(name)
+        except OSError:
+            missing.append(name)
+    return missing
+
+
+def check_gpu(model):
+    """Encodes 30 s of silence: a GPU that CTranslate2 can't use fails here, not halfway."""
+    import numpy as np
+
+    features = model.feature_extractor(np.zeros(16000 * 30, dtype=np.float32))
+    features = features[:, :model.feature_extractor.nb_max_frames]
+    model.encode(features)
+
+
 def load_model(args):
     from faster_whisper import WhisperModel
     import ctranslate2
@@ -454,6 +491,12 @@ def load_model(args):
         try:
             device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
         except Exception:
+            device = "cpu"
+    if device == "cuda":
+        missing = missing_cuda_libraries()
+        if missing:
+            log("GPU libraries not found (%s), using the CPU. For the GPU, extract "
+                "fasterwhisper_cuda_win64.zip next to whisper-faster." % ", ".join(missing))
             device = "cpu"
 
     def compute_for(dev):
@@ -468,11 +511,14 @@ def load_model(args):
 
     try:
         model = create(device)
+        if device == "cuda":
+            check_gpu(model)
     except Exception as e:
         if device != "cuda":
             raise
-        # without the GPU libraries (cuBLAS/cuDNN) or an old GPU: on the CPU
+        # an old GPU, not enough GPU memory, a float16 the GPU doesn't have...: on the CPU
         log("GPU not available (%s), using the CPU." % e)
+        model = None  # frees the GPU memory
         device = "cpu"
         model = create(device)
 
@@ -532,7 +578,7 @@ def segment_to_dict(s):
     return d
 
 
-def transcribe_file(model, audio, args):
+def transcribe_file(model, audio, args, progress=None):
     log("Transcribing: %s" % audio)
     start = time.time()
     data = read_wav(audio) if audio.lower().endswith(".wav") else None
@@ -544,6 +590,8 @@ def transcribe_file(model, audio, args):
     for s in segments:
         d = segment_to_dict(s)
         result.append(d)
+        if progress is not None:
+            progress.append(d)
         if args.verbose:
             # mm:ss.zzz until one hour, then hh:mm:ss.zzz (as Tero reads it)
             print("[%s --> %s] %s" % (ts(s.start, ".", False), ts(s.end, ".", False), s.text.strip()), flush=True)
@@ -565,7 +613,7 @@ def main(argv=None):
         return 1
 
     try:
-        model, _ = load_model(args)
+        model, device = load_model(args)
     except Exception as e:
         log("Error loading the model '%s': %s" % (args.model, e))
         return 2
@@ -576,9 +624,20 @@ def main(argv=None):
             log("File not found: %s" % audio)
             code = 3
             continue
+        done = []
         try:
-            transcribe_file(model, audio, args)
+            transcribe_file(model, audio, args, done)
         except Exception as e:
+            if device == "cuda" and not done:
+                # the GPU failed before the first segment: again on the CPU
+                log("GPU error (%s), transcribing on the CPU." % e)
+                try:
+                    args.device = "cpu"
+                    model, device = load_model(args)
+                    transcribe_file(model, audio, args)
+                    continue
+                except Exception as e2:
+                    e = e2
             log("Error transcribing '%s': %s" % (audio, e))
             code = 4
     return code
