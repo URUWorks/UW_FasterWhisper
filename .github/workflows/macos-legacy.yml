@@ -68,6 +68,8 @@ jobs:
             "$PY" -m pip install -q --no-binary pyinstaller "pyinstaller==$PYINSTALLER_VERSION"
           echo "PYTHONPATH=$PWD/site" >> $GITHUB_ENV
           ls site
+          # CTranslate2 loads with its own libraries, without the build folders
+          (cd / && PYTHONPATH="$GITHUB_WORKSPACE/site" "$PY" -c "import ctranslate2; print('ctranslate2', ctranslate2.__version__, ctranslate2.get_supported_compute_types('cpu'))")
 
       - name: Build
         run: |
