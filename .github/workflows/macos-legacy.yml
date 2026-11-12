@@ -1,0 +1,102 @@
+# whisper-faster for Intel Macs with macOS 10.11 to 10.15
+# (fasterwhisper_macos_legacy_x86_64.zip), on its own while it's tested:
+# Actions > macOS legacy > Run workflow, the zip is left as an artifact.
+#
+# - Python 3.11 of python.org (macOS 10.9 and up)
+# - CTranslate2 built for 10.11 with its own libc++ (scripts/legacy-macos)
+# - numpy, tokenizers... the last wheels for 10.9 or older
+# - PyInstaller with its bootloader built for 10.11
+# - check-macho.sh fails the build if something needs a newer macOS
+
+name: macOS legacy
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11.9"
+  LLVM_VERSION: "19.1.7"
+  CT2_VERSION: "4.8.5"
+  FASTER_WHISPER_VERSION: "1.2.1"
+  PYINSTALLER_VERSION: "6.22.3"
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Python ${{ env.PYTHON_VERSION }} (python.org)
+        run: |
+          curl -fsSL -o python.pkg "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-macos11.pkg"
+          sudo installer -pkg python.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11
+          "$PY" --version
+          "$PY" -m pip install -q --upgrade pip
+          echo "PY=$PY" >> $GITHUB_ENV
+
+      - name: Cache of libc++
+        id: cache-libcxx
+        uses: actions/cache@v4
+        with:
+          path: libcxx
+          key: libcxx-${{ env.LLVM_VERSION }}-macos10.11-${{ hashFiles('scripts/legacy-macos/build-libcxx.sh', 'scripts/legacy-macos/clock_gettime-compat.c') }}
+
+      - name: libc++ ${{ env.LLVM_VERSION }} for macOS 10.11
+        if: steps.cache-libcxx.outputs.cache-hit != 'true'
+        run: bash scripts/legacy-macos/build-libcxx.sh "$LLVM_VERSION" "$PWD/libcxx"
+
+      - name: Cache of CTranslate2
+        id: cache-ct2
+        uses: actions/cache@v4
+        with:
+          path: wheels
+          key: ct2-${{ env.CT2_VERSION }}-py${{ env.PYTHON_VERSION }}-macos10.11-${{ hashFiles('scripts/legacy-macos/*', '.github/workflows/macos-legacy.yml') }}
+
+      - name: CTranslate2 ${{ env.CT2_VERSION }} for macOS 10.11
+        if: steps.cache-ct2.outputs.cache-hit != 'true'
+        run: bash scripts/legacy-macos/build-ctranslate2.sh "$CT2_VERSION" "$PWD/libcxx" "$PY" "$PWD/wheels"
+
+      - name: Install
+        run: |
+          mkdir site
+          "$PY" -m pip install -q --target site --no-deps wheels/ctranslate2-*.whl "faster-whisper==$FASTER_WHISPER_VERSION"
+          "$PY" -m pip install -q --target site --only-binary=:all: --platform macosx_10_11_x86_64 \
+            --python-version 3.11 --implementation cp -r requirements-macos-legacy.txt
+          # PyInstaller with the bootloader for 10.11 (the one of the wheel is 10.13)
+          MACOSX_DEPLOYMENT_TARGET=10.11 PYINSTALLER_COMPILE_BOOTLOADER=1 \
+            "$PY" -m pip install -q --no-binary pyinstaller "pyinstaller==$PYINSTALLER_VERSION"
+          echo "PYTHONPATH=$PWD/site" >> $GITHUB_ENV
+          ls site
+
+      - name: Build
+        run: |
+          "$PY" -m PyInstaller --noconfirm --clean whisper-faster.spec
+          ls dist/whisper-faster/_internal
+
+      - name: Check for macOS 10.11
+        run: bash scripts/legacy-macos/check-macho.sh dist/whisper-faster
+
+      - name: Test the arguments
+        run: |
+          dist/whisper-faster/whisper-faster --version
+          dist/whisper-faster/whisper-faster --help > /dev/null
+
+      - name: Test a transcription
+        run: |
+          say -o test.wav --file-format=WAVE --data-format=LEI16@22050 "Hello, this is a test of the subtitle program."
+          dist/whisper-faster/whisper-faster test.wav --model tiny --model_dir models --device cpu --language en --output_format srt --output_dir out
+          cat out/test.srt
+          grep -q -- "-->" out/test.srt
+          grep -qi "test" out/test.srt
+          # float32, as on a Mac without AVX2
+          dist/whisper-faster/whisper-faster test.wav --model tiny --model_dir models --device cpu --compute_type float32 --language en --output_format srt --output_dir out32
+          grep -qi "test" out32/test.srt
+
+      - name: Zip
+        run: cd dist/whisper-faster && zip -qry ../../fasterwhisper_macos_legacy_x86_64.zip .
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: fasterwhisper_macos_legacy_x86_64.zip
+          path: fasterwhisper_macos_legacy_x86_64.zip

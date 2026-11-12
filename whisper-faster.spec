@@ -2,10 +2,16 @@
 # PyInstaller: pyinstaller whisper-faster.spec
 # One folder (faster to start than one file): whisper-faster[.exe] + _internal
 
+import importlib.util
+
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 datas, binaries, hiddenimports = [], [], []
 for pkg in ("ctranslate2", "faster_whisper", "tokenizers", "onnxruntime"):
+    if importlib.util.find_spec(pkg) is None:
+        # onnxruntime (--vad_filter) is not in the macOS 10.11 build
+        print("Not installed, left out: %s" % pkg)
+        continue
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 

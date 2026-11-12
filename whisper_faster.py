@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 PROG = "whisper-faster"
 
@@ -471,6 +471,22 @@ def missing_cuda_libraries():
     return missing
 
 
+def cpu_without_fast_int8():
+    """An Intel Mac without AVX2 (Mac Pro 2009-2012...): the int8 of the macOS
+    10.11 build (Ruy) has no fast code there, float32 (Accelerate) is faster."""
+    if sys.platform != "darwin":
+        return False
+    import platform
+    import subprocess
+    if platform.machine() != "x86_64":
+        return False
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.optional.avx2_0"], capture_output=True, text=True)
+        return out.stdout.strip() != "1"
+    except Exception:
+        return False
+
+
 def check_gpu(model):
     """Encodes 30 s of silence: a GPU that CTranslate2 can't use fails here, not halfway."""
     import numpy as np
@@ -502,7 +518,9 @@ def load_model(args):
     def compute_for(dev):
         if args.compute_type != "auto":
             return args.compute_type
-        return "float16" if dev == "cuda" else "int8"
+        if dev == "cuda":
+            return "float16"
+        return "float32" if cpu_without_fast_int8() else "int8"
 
     def create(dev):
         return WhisperModel(path, device=dev, device_index=args.device_index,
@@ -578,8 +596,20 @@ def segment_to_dict(s):
     return d
 
 
+def vad_available():
+    try:
+        import onnxruntime  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def transcribe_file(model, audio, args, progress=None):
     log("Transcribing: %s" % audio)
+    if args.vad_filter and not vad_available():
+        # the macOS 10.11 build has no onnxruntime (there is none for it)
+        log("The VAD filter is not available in this build, transcribing without it.")
+        args.vad_filter = False
     start = time.time()
     data = read_wav(audio) if audio.lower().endswith(".wav") else None
     segments, info = model.transcribe(audio if data is None else data, **transcribe_options(args))

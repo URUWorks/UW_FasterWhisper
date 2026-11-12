@@ -1,0 +1,11 @@
+# whisper-faster for Intel Macs with macOS 10.11 to 10.15: the last versions
+# with builds that run there. CTranslate2 is built from source
+# (scripts/legacy-macos), and faster-whisper is installed without its
+# dependencies, because onnxruntime (only for --vad_filter) has no build for
+# these macOS versions.
+tokenizers==0.15.0
+huggingface_hub==0.31.4
+numpy==2.0.2
+pyyaml==6.0.2
+tqdm
+requests
