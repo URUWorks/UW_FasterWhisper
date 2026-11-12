@@ -37,9 +37,24 @@ cd ct2/python
 CTRANSLATE2_ROOT="$WORK/install" \
 CFLAGS="$CXXF" CXXFLAGS="$CXXF" LDFLAGS="$LDF" \
   "$PY" -m pip wheel --no-deps --no-build-isolation -w "$WORK/dist" .
-# the libraries inside the wheel (ctranslate2/.dylibs), as the official wheels
-"$PY" -m pip install -q delocate
-"$("$PY" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/delocate-wheel" \
-  --require-archs x86_64 -w "$OUT" -v "$WORK"/dist/*.whl
+# the libraries inside the package, next to _ext (as the official wheels,
+# but by hand: delocate doesn't follow the @rpath of our libc++)
+"$PY" -m pip install -q wheel
+"$PY" -m wheel unpack -d "$WORK/unpacked" "$WORK"/dist/*.whl
+PKG=$(ls -d "$WORK"/unpacked/ctranslate2-*/ctranslate2)
+CT2LIB=$(otool -D "$WORK"/install/lib/libctranslate2.*.*.dylib | tail -1 | sed 's|@rpath/||')
+cp -L "$WORK/install/lib/$CT2LIB" "$LCXX/lib/libc++.1.dylib" "$LCXX/lib/libc++abi.1.dylib" "$PKG/"
+chmod u+w "$PKG"/*.dylib
+for f in "$PKG"/_ext*.so "$PKG"/*.dylib; do
+  # only @loader_path (the folder of the package) to find the others
+  for r in $(otool -l "$f" | awk '/LC_RPATH/{getline; getline; print $2}'); do
+    install_name_tool -delete_rpath "$r" "$f"
+  done
+  install_name_tool -add_rpath @loader_path "$f"
+  codesign -f -s - "$f"
+  echo "== $(basename "$f")"; otool -L "$f" | tail -n +2; otool -l "$f" | grep -A2 LC_RPATH | grep path
+done
+mkdir -p "$OUT"
+"$PY" -m wheel pack -d "$OUT" "$WORK"/unpacked/ctranslate2-*
 ls -la "$OUT"
 rm -rf "$WORK"
