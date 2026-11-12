@@ -217,9 +217,15 @@ jobs:
           name: fasterwhisper_cuda_win64.zip
           path: fasterwhisper_cuda_win64.zip
 
+  # Intel Macs with macOS 10.11 to 10.15 (macos-legacy.yml)
+  macos-legacy:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    uses: ./.github/workflows/macos-legacy.yml
+
   # every release has all the zips, Tero downloads them from "latest"
   release:
-    needs: [check, build, gpu-windows]
+    needs: [check, build, gpu-windows, macos-legacy]
     if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-latest
     env:

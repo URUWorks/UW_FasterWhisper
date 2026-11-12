@@ -68,6 +68,7 @@ The workflow `.github/workflows/build.yml` builds everything:
 | `fasterwhisper_cuda_win64.zip` | Windows, NVIDIA GPU libraries (optional) |
 | `fasterwhisper_macos_arm64.zip` | macOS 11+, Apple Silicon |
 | `fasterwhisper_macos_x86_64.zip` | macOS 11+, Intel |
+| `fasterwhisper_macos_legacy_x86_64.zip` | macOS 10.11 to 10.15, Intel |
 | `fasterwhisper_linux.zip` | Linux x64 (glibc 2.35+, Ubuntu 22.04 and later) |
 
 Tero Subtitler downloads them from `releases/latest/download/<file>`, so a new release is used
