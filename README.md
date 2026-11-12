@@ -5,7 +5,7 @@ for [Tero Subtitler](https://github.com/URUWorks/TeroSubtitler), for Windows, ma
 (Apple Silicon and Intel) and Linux.
 
 It's a drop-in replacement of the Purfview's `whisper-faster` that Tero Subtitler used: same
-executable name and the same parameters, so Tero works with it without changes.
+executable name and the same parameters, so Tero Subtitler works with it without changes.
 
 ## Usage
 
