@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 PROG = "whisper-faster"
 
@@ -207,6 +207,12 @@ def build_parser():
     g = p.add_argument_group("transcription")
     g.add_argument("--task", default="transcribe", choices=["transcribe", "translate"], help="translate = to english")
     g.add_argument("--language", "-l", default=None, help="language code (en, es...), detected if not given")
+    g.add_argument("--multilingual", type=str2bool, default=False,
+                   help="detect the language again in each 30 s window, for audio that mixes languages")
+    g.add_argument("--language_detection_threshold", type=optional_float, default=0.5,
+                   help="detection: probability to accept a language without looking at more audio")
+    g.add_argument("--language_detection_segments", type=int, default=1,
+                   help="detection: 30 s windows of audio used to detect the language at the start")
     g.add_argument("--word_timestamps", type=str2bool, default=False, help="times of each word (json)")
     g.add_argument("--beam_size", type=int, default=5)
     g.add_argument("--best_of", type=int, default=5)
@@ -567,7 +573,10 @@ def transcribe_options(args):
     suppress = [int(x) for x in str(args.suppress_tokens).split(",") if x.strip()]
 
     opts = dict(
-        language=args.language, task=args.task, beam_size=args.beam_size, best_of=args.best_of,
+        language=args.language, task=args.task, multilingual=args.multilingual,
+        language_detection_threshold=args.language_detection_threshold,
+        language_detection_segments=max(1, args.language_detection_segments),
+        beam_size=args.beam_size, best_of=args.best_of,
         patience=args.patience, length_penalty=args.length_penalty,
         repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
         temperature=temps, compression_ratio_threshold=args.compression_ratio_threshold,
@@ -615,6 +624,8 @@ def transcribe_file(model, audio, args, progress=None):
     segments, info = model.transcribe(audio if data is None else data, **transcribe_options(args))
     if args.language is None:
         log("Detected language '%s' with probability %.2f" % (info.language, info.language_probability))
+    if args.multilingual:
+        log("Multilingual: the language is detected again in each 30 s window.")
 
     result = []
     for s in segments:
