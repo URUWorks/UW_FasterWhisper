@@ -28,6 +28,11 @@ whisper-faster audio.wav --model medium --model_dir <models> --output_dir <out> 
 - `--vad_filter True` and the `--vad_*` options, `--language`, `--task translate`,
   `--beam_size`, `--condition_on_previous_text`, `--initial_prompt`, `--hotwords`,
   `--hallucination_silence_threshold`... `whisper-faster --help` lists all of them.
+- `--multilingual True`: for audio that mixes languages. Without it the language is
+  detected once, with the first 30 seconds, and everything is transcribed in that language
+  (the lines in other languages are lost or come out wrong). With it, the language is
+  detected again in each 30 s window. Use it without `--language`.
+  `--language_detection_threshold` and `--language_detection_segments` tune the detection.
 - Unknown parameters (of other versions) are ignored with a warning.
 - While transcribing, each segment is printed as `[mm:ss.zzz --> mm:ss.zzz] text`
   (`hh:mm:ss.zzz` after one hour), Tero Subtitler shows them as they come.
