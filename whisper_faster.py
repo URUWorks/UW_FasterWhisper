@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 PROG = "whisper-faster"
 
@@ -188,7 +188,9 @@ def build_parser():
     g = p.add_argument_group("model")
     g.add_argument("--model", "-m", default="medium", help="model name (tiny, base, small, medium, large-v3...) or a model folder")
     g.add_argument("--model_dir", default=None, help="folder of the models, with a 'faster-whisper-<model>' folder for each one")
-    g.add_argument("--device", "-d", default="auto", help="auto, cpu or cuda")
+    g.add_argument("--device", "-d", default="auto",
+                   help="auto, cpu, cuda or openvino (Intel GPU/NPU/CPU, needs the OpenVINO zip; "
+                        "openvino:GPU, openvino:NPU... to choose)")
     g.add_argument("--device_index", type=int, default=0, help="GPU number")
     g.add_argument("--compute_type", "-ct", default="auto", help="auto, int8, int8_float16, float16, float32...")
     g.add_argument("--threads", type=int, default=0, help="CPU threads, 0 = automatic")
@@ -233,6 +235,24 @@ def build_parser():
     g.add_argument("--hallucination_silence_threshold", type=optional_float, default=None)
     g.add_argument("--chunk_length", type=optional_int, default=None)
     g.add_argument("--clip_timestamps", default="0")
+
+    g = p.add_argument_group("fixes")
+    g.add_argument("--loop_recovery", type=str2bool, default=True,
+                   help="when whisper gets stuck repeating a phrase, decode that part again (the dialog lost there comes back)")
+    g.add_argument("--retime", type=str2bool, default=True,
+                   help="move the segments that start long before their words (after a silence) to where the words are")
+    g.add_argument("--retime_threshold", type=float, default=0.4,
+                   help="retime: minimum confidence (average word probability) to move a segment")
+
+    g = p.add_argument_group("speakers")
+    g.add_argument("--diarize", type=str2bool, default=False,
+                   help="find who speaks in each segment (downloads a 28 MB model the first time)")
+    g.add_argument("--num_speakers", type=optional_int, default=None, help="number of speakers, if known")
+    g.add_argument("--max_speakers", type=optional_int, default=None, help="at most this many speakers")
+    g.add_argument("--diarize_threshold", type=float, default=0.5,
+                   help="voice similarity to join two speakers (higher = more speakers)")
+    g.add_argument("--speaker_format", default="[Speaker %d] ",
+                   help="label before the text (srt, txt, tsv; vtt uses <v>), empty = only in the json")
 
     g = p.add_argument_group("voice activity detection")
     g.add_argument("--vad_filter", type=str2bool, default=False, help="skip the parts without voice")
@@ -305,7 +325,8 @@ def balance_lines(text, width, count):
 
 
 def chunk_words(words, width, count, sentence, max_comma):
-    """Timed words [(start, end, text)] -> subtitles [(start, end, [words])]."""
+    """Timed words [(start, end, text, speaker)] -> subtitles [(start, end,
+    [words], speaker)]. A new speaker starts a new subtitle."""
     subs, cur = [], []
 
     def fits(ws):
@@ -317,6 +338,9 @@ def chunk_words(words, width, count, sentence, max_comma):
         if not w[2].strip():
             continue
         cand = cur + [w]
+        if cur and cur[-1][3] != w[3]:
+            subs.append(cur)
+            cur, cand = [], [w]
         if cur and width and count and not fits(cand):
             subs.append(cur)
             cur = [w]
@@ -331,21 +355,21 @@ def chunk_words(words, width, count, sentence, max_comma):
             cur = []
     if cur:
         subs.append(cur)
-    return [(s[0][0], s[-1][1], [x[2].strip() for x in s]) for s in subs]
+    return [(s[0][0], s[-1][1], [x[2].strip() for x in s], s[0][3]) for s in subs]
 
 
 def make_subtitles(segments, args):
-    """Segments -> [(start, end, text with \\n)] for srt/vtt."""
+    """Segments -> [(start, end, text with \\n, speaker or None)] for srt/vtt."""
     width, count = args.max_line_width, args.max_line_count
     has_words = all(s.get("words") for s in segments) and segments
     result = []
 
     if has_words and (args.sentence or (width and count)):
-        words = [(w["start"], w["end"], w["word"]) for s in segments for w in s["words"]]
-        for start, end, ws in chunk_words(words, width, count, args.sentence, args.max_comma):
+        words = [(w["start"], w["end"], w["word"], s.get("speaker")) for s in segments for w in s["words"]]
+        for start, end, ws, spk in chunk_words(words, width, count, args.sentence, args.max_comma):
             text = " ".join(ws)
             lines = balance_lines(text, width, count) if width else [text]
-            result.append((start, end, "\n".join(lines)))
+            result.append((start, end, "\n".join(lines), spk))
         return result
 
     for s in segments:
@@ -361,43 +385,57 @@ def make_subtitles(segments, args):
                 t = s["start"]
                 for g in groups:
                     d = (s["end"] - s["start"]) * len(" ".join(g)) / max(1, total)
-                    result.append((t, t + d, "\n".join(g)))
+                    result.append((t, t + d, "\n".join(g), s.get("speaker")))
                     t += d
                 continue
             text = "\n".join(lines)
-        result.append((s["start"], s["end"], text))
+        result.append((s["start"], s["end"], text, s.get("speaker")))
     return result
+
+
+def speaker_label(spk, fmt):
+    if spk is None or not fmt:
+        return ""
+    try:
+        return fmt % spk
+    except (TypeError, ValueError):
+        return fmt.replace("%d", str(spk))
 
 
 # -----------------------------------------------------------------------------
 # writers
 # -----------------------------------------------------------------------------
 
-def write_srt(path, subs):
+def write_srt(path, subs, fmt=""):
     with open(path, "w", encoding="utf-8") as f:
-        for i, (a, b, t) in enumerate(subs, 1):
-            f.write("%d\n%s --> %s\n%s\n\n" % (i, ts(a), ts(b), t))
+        for i, (a, b, t, spk) in enumerate(subs, 1):
+            f.write("%d\n%s --> %s\n%s%s\n\n" % (i, ts(a), ts(b), speaker_label(spk, fmt), t))
 
 
-def write_vtt(path, subs):
+def write_vtt(path, subs, fmt=""):
     with open(path, "w", encoding="utf-8") as f:
         f.write("WEBVTT\n\n")
-        for a, b, t in subs:
+        for a, b, t, spk in subs:
+            if spk is not None:
+                # the voice tag of WebVTT
+                name = speaker_label(spk, fmt).strip(" []():") or "Speaker %d" % spk
+                t = "<v %s>%s" % (name, t)
             f.write("%s --> %s\n%s\n\n" % (ts(a, "."), ts(b, "."), t))
 
 
-def write_txt(path, segments):
+def write_txt(path, segments, fmt=""):
     with open(path, "w", encoding="utf-8") as f:
         for s in segments:
-            f.write(s["text"].strip() + "\n")
+            f.write(speaker_label(s.get("speaker"), fmt) + s["text"].strip() + "\n")
 
 
-def write_tsv(path, segments):
+def write_tsv(path, segments, fmt=""):
     with open(path, "w", encoding="utf-8") as f:
         f.write("start\tend\ttext\n")
         for s in segments:
+            text = speaker_label(s.get("speaker"), fmt) + s["text"].strip()
             f.write("%d\t%d\t%s\n" % (round(s["start"] * 1000), round(s["end"] * 1000),
-                                      s["text"].strip().replace("\t", " ")))
+                                      text.replace("\t", " ")))
 
 
 def write_json(path, segments, language):
@@ -416,16 +454,17 @@ def write_outputs(audio, segments, language, args):
     os.makedirs(args.output_dir, exist_ok=True)
     base = os.path.join(args.output_dir, os.path.splitext(os.path.basename(audio))[0])
     fmts = ["txt", "vtt", "srt", "tsv", "json"] if args.output_format == "all" else [args.output_format]
+    label = args.speaker_format if args.diarize else ""
     for fmt in fmts:
         path = base + "." + fmt
         if fmt == "srt":
-            write_srt(path, make_subtitles(segments, args))
+            write_srt(path, make_subtitles(segments, args), label)
         elif fmt == "vtt":
-            write_vtt(path, make_subtitles(segments, args))
+            write_vtt(path, make_subtitles(segments, args), label)
         elif fmt == "txt":
-            write_txt(path, segments)
+            write_txt(path, segments, label)
         elif fmt == "tsv":
-            write_tsv(path, segments)
+            write_tsv(path, segments, label)
         elif fmt == "json":
             write_json(path, segments, language)
         log("Subtitles are written to '%s'" % os.path.abspath(path))
@@ -613,31 +652,192 @@ def vad_available():
         return False
 
 
-def transcribe_file(model, audio, args, progress=None):
+def load_audio(audio):
+    """The audio as 16 kHz mono float32: the wav reader, or PyAV for the rest."""
+    data = read_wav(audio) if audio.lower().endswith(".wav") else None
+    if data is None:
+        from faster_whisper.audio import decode_audio
+        data = decode_audio(audio, sampling_rate=16000)
+    return data
+
+
+def speech_in_range(audio, start, end):
+    """Seconds of voice between start and end (silero VAD), None without it."""
+    if end - start < 0.3 or not vad_available():
+        return None
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    a, b = int(start * 16000), int(end * 16000)
+    chunks = get_speech_timestamps(audio[a:b], VadOptions())
+    return sum(c["end"] - c["start"] for c in chunks) / 16000.0
+
+
+# -----------------------------------------------------------------------------
+# engines: faster-whisper (CTranslate2) and OpenVINO GenAI. What the fixes
+# (transcript_fixes.py) need of them:
+#   transcribe(audio, args) -> (segments iterator, language, probability)
+#   decode_range(audio, start, end, language) -> segments of that part
+#   align(audio, segment, next segment, language) -> its words (optional)
+#   speech_in_range(audio, start, end) -> seconds of voice (optional)
+# -----------------------------------------------------------------------------
+
+class FasterWhisperEngine:
+    name = "faster-whisper"
+
+    def __init__(self, model, device, args):
+        self.model = model
+        self.device = device
+        self.args = args
+        self.opts = transcribe_options(args)
+        self._tokenizers = {}
+
+    speech_in_range = staticmethod(speech_in_range)
+
+    def transcribe(self, audio, args):
+        segments, info = self.model.transcribe(audio, **self.opts)
+        return (segment_to_dict(s) for s in segments), info.language, info.language_probability
+
+    def decode_range(self, audio, start, end, language):
+        opts = dict(self.opts)
+        # only this part, without what came before (it can be the loop)
+        opts.update(vad_filter=False, vad_parameters=None, clip_timestamps="0",
+                    condition_on_previous_text=False, initial_prompt=None)
+        if not self.args.multilingual:
+            opts["language"] = language
+        a, b = int(start * 16000), int(end * 16000)
+        segments, _info = self.model.transcribe(audio[a:b], **opts)
+        result = []
+        for s in segments:
+            d = segment_to_dict(s)
+            d["start"] = round(d["start"] + start, 3)
+            d["end"] = round(d["end"] + start, 3)
+            for w in d.get("words") or []:
+                w["start"] = round(w["start"] + start, 3)
+                w["end"] = round(w["end"] + start, 3)
+            result.append(d)
+        return result
+
+    def _tokenizer(self, language):
+        from faster_whisper.tokenizer import Tokenizer
+        key = language or "en"
+        if key not in self._tokenizers:
+            self._tokenizers[key] = Tokenizer(self.model.hf_tokenizer, self.model.model.is_multilingual,
+                                              task=self.args.task, language=key)
+        return self._tokenizers[key]
+
+    def align(self, audio, seg, nxt, language):
+        """The words of seg in the audio from its start to the end of the next
+        segment (its text is the anchor that says where seg's text ends), at
+        most 30 s. Only this window is encoded, the rest of the decoding is
+        not touched (no word timestamps needed)."""
+        from faster_whisper.audio import pad_or_trim
+
+        tok = self._tokenizer(language)
+        toks = [t for t in seg.get("tokens") or [] if t < tok.eot]
+        if not toks:
+            return None
+        nxt_toks = []
+        end = seg["end"]
+        if nxt is not None and nxt["end"] - seg["start"] <= 30.0:
+            nxt_toks = [t for t in nxt.get("tokens") or [] if t < tok.eot]
+            if nxt_toks:
+                end = nxt["end"]
+        start = max(seg["start"], end - 30.0)
+        fe = self.model.feature_extractor
+        a, b = int(start * 16000), int(end * 16000)
+        piece = audio[a:b]
+        num_frames = min(fe.nb_max_frames, len(piece) // fe.hop_length)
+        if num_frames < 10:
+            return None
+        features = pad_or_trim(fe(piece)[:, :fe.nb_max_frames])
+        encoder_output = self.model.encode(features)
+        words = self.model.find_alignment(tok, [toks + nxt_toks], encoder_output, num_frames)[0]
+        out, used = [], 0
+        for w in words:
+            if used >= len(toks):
+                break
+            used += len(w["tokens"])
+            if w["word"].strip():
+                out.append({"word": w["word"], "start": start + float(w["start"]),
+                            "end": start + float(w["end"]), "probability": float(w["probability"])})
+        return out
+
+
+def load_engine(args):
+    if args.device.split(":")[0] == "openvino":
+        import openvino_backend
+        if not openvino_backend.available(app_dir()):
+            log("OpenVINO is not available (extract fasterwhisper_openvino zip next to "
+                "whisper-faster), using faster-whisper.")
+            args.device = "auto"
+        else:
+            engine = openvino_backend.OpenVINOEngine(args, app_dir(), log)
+            engine.speech_in_range = speech_in_range
+            return engine
+    model, device = load_model(args)
+    return FasterWhisperEngine(model, device, args)
+
+
+def transcribe_file(engine, audio, args, progress=None):
+    from transcript_fixes import Fixer
+
     log("Transcribing: %s" % audio)
     if args.vad_filter and not vad_available():
         # the macOS 10.11 build has no onnxruntime (there is none for it)
         log("The VAD filter is not available in this build, transcribing without it.")
         args.vad_filter = False
+        if isinstance(engine, FasterWhisperEngine):
+            engine.opts = transcribe_options(args)
     start = time.time()
-    data = read_wav(audio) if audio.lower().endswith(".wav") else None
-    segments, info = model.transcribe(audio if data is None else data, **transcribe_options(args))
-    if args.language is None:
-        log("Detected language '%s' with probability %.2f" % (info.language, info.language_probability))
+    data = load_audio(audio)
+    segments, language, probability = engine.transcribe(data, args)
+    if args.language is None and probability is not None:
+        log("Detected language '%s' with probability %.2f" % (language, probability))
+    elif args.language is None:
+        log("Detected language '%s'" % language)
     if args.multilingual:
         log("Multilingual: the language is detected again in each 30 s window.")
 
+    fixer = Fixer(engine, data, language, loop_recovery=args.loop_recovery, retime=args.retime,
+                  retime_threshold=args.retime_threshold,
+                  cr_threshold=args.compression_ratio_threshold or 2.4,
+                  no_speech_threshold=args.no_speech_threshold or 0.6, log=log)
     result = []
-    for s in segments:
-        d = segment_to_dict(s)
+
+    def emit(d):
+        d["id"] = len(result)
         result.append(d)
         if progress is not None:
             progress.append(d)
         if args.verbose:
             # mm:ss.zzz until one hour, then hh:mm:ss.zzz (as Tero reads it)
-            print("[%s --> %s] %s" % (ts(s.start, ".", False), ts(s.end, ".", False), s.text.strip()), flush=True)
+            print("[%s --> %s] %s" % (ts(d["start"], ".", False), ts(d["end"], ".", False),
+                                     d["text"].strip()), flush=True)
 
-    write_outputs(audio, result, info.language, args)
+    for s in segments:
+        for d in fixer.feed(s):
+            emit(d)
+    for d in fixer.flush():
+        emit(d)
+    if fixer.loops_fixed or fixer.retimed:
+        log("Fixes: %d loop(s), %d stretched segment(s)" % (fixer.loops_fixed, fixer.retimed))
+
+    if args.diarize:
+        if not vad_available():
+            log("Speakers are not available in this build (no onnxruntime).")
+            args.diarize = False
+        else:
+            import diarization
+            folder = os.path.join(args.model_dir or app_dir(), "diarization")
+            try:
+                n = diarization.diarize(data, result, folder, num_speakers=args.num_speakers,
+                                        max_speakers=args.max_speakers, threshold=args.diarize_threshold,
+                                        threads=args.threads, download=not args.local_files_only, log=log)
+                log("Speakers: %d" % n)
+            except Exception as e:
+                log("Speakers not found (%s), the subtitles are written without them." % e)
+                args.diarize = False
+
+    write_outputs(audio, result, language, args)
     log("Operation finished in: %.1f s" % (time.time() - start))
 
 
@@ -654,7 +854,7 @@ def main(argv=None):
         return 1
 
     try:
-        model, device = load_model(args)
+        engine = load_engine(args)
     except Exception as e:
         log("Error loading the model '%s': %s" % (args.model, e))
         return 2
@@ -666,21 +866,23 @@ def main(argv=None):
             code = 3
             continue
         done = []
+        diarize = args.diarize
         try:
-            transcribe_file(model, audio, args, done)
+            transcribe_file(engine, audio, args, done)
         except Exception as e:
-            if device == "cuda" and not done:
+            if getattr(engine, "device", "") == "cuda" and not done:
                 # the GPU failed before the first segment: again on the CPU
                 log("GPU error (%s), transcribing on the CPU." % e)
                 try:
                     args.device = "cpu"
-                    model, device = load_model(args)
-                    transcribe_file(model, audio, args)
+                    engine = load_engine(args)
+                    transcribe_file(engine, audio, args)
                     continue
                 except Exception as e2:
                     e = e2
             log("Error transcribing '%s': %s" % (audio, e))
             code = 4
+        args.diarize = diarize
     return code
 
 

@@ -15,13 +15,22 @@ for pkg in ("ctranslate2", "faster_whisper", "tokenizers", "onnxruntime"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 
+# the fixes, the speakers and the OpenVINO backend (imported when used)
+hiddenimports += ["transcript_fixes", "diarization", "openvino_backend"]
+# what openvino-genai needs of the standard library: it's not in this build
+# (fasterwhisper_openvino_<system>.zip, extracted next to the executable),
+# but it runs with this Python
+hiddenimports += ["hashlib", "uuid", "pkgutil", "tracemalloc", "gettext", "http.client",
+                  "multiprocessing", "importlib.metadata"]
+
 a = Analysis(
     ["whisper_faster.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["av", "hf_xet", "tkinter", "matplotlib", "IPython", "pytest", "torch", "tensorflow"],
+    excludes=["av", "hf_xet", "tkinter", "matplotlib", "IPython", "pytest", "torch", "tensorflow",
+              "openvino", "openvino_genai", "openvino_tokenizers", "openvino_telemetry"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

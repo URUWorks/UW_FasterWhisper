@@ -1,0 +1,7 @@
+# The optional OpenVINO zip (--device openvino, Intel GPUs/NPUs): these are
+# installed in an "openvino" folder next to whisper-faster, with the same
+# Python as the build (3.12). The versions go together.
+openvino==2026.4.1
+openvino-genai==2026.4.1.0
+openvino-tokenizers==2026.4.1.0
+packaging==26.3
